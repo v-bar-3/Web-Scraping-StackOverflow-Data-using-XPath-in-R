@@ -1,0 +1,413 @@
+---
+title: "Project 4"
+author: "Vincent Barletta"
+date: "2023-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+install.packages("RCurl", repos = "http://cran.us.r-project.org")
+install.packages("httr", repos = "http://cran.us.r-project.org")
+install.packages("xml2", repos = "http://cran.us.r-project.org")
+install.packages("rvest", repos = "http://cran.us.r-project.org")
+
+
+library(RCurl)
+library(httr)
+library(xml2)
+library(rvest)  # For simplified HTML parsing
+
+```
+
+We will begin by reading in the four URLs for the pages that we are going to scrape. We build a basic function to get the access html format for each URL. For each step in the future, we will go descending levels to access the data that we want. On the main page with all the questions, our first navigation is to go into the questions div and pull the first element which contains all question information.
+
+```{r}
+#Four pages we want to scrape from
+url1 <- "https://stackoverflow.com/questions/tagged/r?tab=newest&pagesize=50"
+url2 <- "https://stackoverflow.com/questions/tagged/r?tab=newest&page=2&pagesize=50"
+url3 <- "https://stackoverflow.com/questions/tagged/r?tab=newest&page=3&pagesize=50"
+url4 <- "https://stackoverflow.com/questions/tagged/r?tab=newest&page=9817&pagesize=50"
+  
+#Initialize the first main page for scraping; we just go into questions Div and receive all 50 questions from the first page
+
+page_generator <- function(url) {
+  page <- read_html(url)
+  main_page_questions <- page %>% html_nodes("div#questions")
+  test_html <- main_page_questions[[1]]
+  return(test_html)
+}
+
+
+```
+
+For starters, we can get a lot of our information from the main list of questions. Let's start with the views, answers, and votes.
+It reads in the page that we want to scrape everything from, and returns a dataframe. With 50 rows corresponding to each of the 50 questions on each URL that we pass in.
+
+We start by going into the summary stats section of the HTML page, and cleaning up the new lines and other "r" characters using gsub. We then split up the different fields that we scrape unintentionally. These numbers are initially stored as characters. Next, we loop through all of the data that we find, and keep only the data that is a digit, as denoted by "d" in the gregexpr call.
+
+Lastly, we combine all of our rows into a data frame with three columns: votes, answers, and views.
+
+We include this first solely because we use it in our larger function down below and it must be initialized before call.
+
+### Views, Answers, Votes
+
+```{r}
+
+views_answers_votes <- function(page) {
+  
+  summary_stats <- page %>% html_nodes('div.s-post-summary--stats.js-post-summary-stats') %>% html_text(trim=T) %>% gsub("\n","",.) %>% gsub("\r","",.)
+  strsplit(summary_stats[1], split = " ")
+  
+  numbers_list <- list()
+  
+  # Iterate over each line in the table
+  for (line in summary_stats) {
+    # Extract numbers using regular expressions
+    numbers <- as.numeric(regmatches(line, gregexpr("\\d+", line))[[1]])
+    # Append the numbers to the list
+    numbers_list <- c(numbers_list, list(numbers))
+  }
+  
+  summary_stats_df <- as.data.frame(do.call(rbind, numbers_list))
+  
+  # Set the column names
+  colnames(summary_stats_df) <- c("votes", "answer", "views")
+  return(summary_stats_df)
+}
+
+```
+
+### Post titles, Username, Rep, Time Posted, Tags (with Views Answers and Votes)
+
+Now, we round off with all of the data that we can obtain from the main page, which I will refer to as the summary page. We start by using the URL we pass in to obtain the correct html page. The next section, "Initialize our primary paths", essentially is  used to shorten each long scraping operation by saving repetitive fields.
+
+
+
+```{r}
+
+question_summary_scraper <- function(url) {
+  
+  #Get the correct html head node
+  test_html <- page_generator(url)
+  
+  #Initialize our primary paths for scraping data 
+  summary_content = test_html %>% html_nodes('div.s-post-summary--content')
+  summary_depth = summary_content %>% html_nodes('div.s-post-summary--meta') 
+  user_card = summary_depth %>% html_nodes('div.s-user-card.s-user-card__minimal')
+  
+  #Scrape our basic data fields
+  
+  #Question Titles
+  post_titles = summary_content %>% html_nodes('h3') %>% html_nodes('a') %>% xml_text
+  
+  #Username
+  username = user_card  %>% html_nodes('div.s-user-card--info') %>% html_nodes('div.s-user-card--link.d-flex.gs4') %>% html_text(trim = T) %>% gsub("\n","",.) %>% gsub("\r","",.) %>% gsub("\\s+"," ",.)
+  
+  #Reputation
+  rep = user_card  %>% html_nodes('div.s-user-card--info') %>% html_nodes('ul') %>% html_text(trim = T) %>% gsub("\n","",.) %>% gsub("\r","",.) %>% gsub("\\s+"," ",.)
+  
+  #Relative Time
+  relative_time = user_card %>% html_nodes('time') %>% html_text(trim = T)
+  
+  #Secondary Tags
+  secondary_tags = summary_content %>% html_nodes('div.s-post-summary--meta-tags') %>% html_text(trim=T)
+  
+  #Views, Answers, and Votes
+  vav <- views_answers_votes(test_html)
+
+  question_metadata <- data.frame(cbind(post_titles, username, rep, relative_time, secondary_tags, vav))
+  return(question_metadata)
+}
+
+```
+
+### Individual Question Scraping (Content, Badges, Most Recent Editor, Edit Time)
+
+Now, we dive into the individual question pages. These functions follow the previous example by scraping small parts from each question page. We will have to do this for each of the 50 questions on each page, so we later utilize lapply from every question link.
+
+The question_links function combines all of the sublinks with stackoverflow.com so that we can directly access each.
+
+```{r}
+#We next retrieve the link for each individual question in order to scrape further answer and comment information
+base_url = "https://stackoverflow.com"
+
+question_links <- function(url) {
+  
+  test_html <- page_generator(url)
+  subquestion_links =  test_html %>% html_nodes('div.s-post-summary--content') %>% html_nodes('h3') %>% html_nodes('a') %>% html_attr('href')
+  question_links = paste0(base_url, subquestion_links, sep = "")
+  return(question_links)
+  
+}
+
+question_content <- function(url) {
+  page <- read_html(url)
+  question_content <- page %>% 
+    html_nodes("div#question.question.js-question") %>%
+    html_nodes("div.s-prose.js-post-body") %>%
+    html_nodes("p") %>%
+    html_text(trim = T)
+  question_content <- paste(question_content, collapse = "")
+  return(question_content)
+}
+
+
+question_badges <- function(question_links) {
+    page2 <- read_html(question_links)
+    user_badges = page2 %>% html_nodes("div.post-signature.owner.flex--item") %>% html_nodes("div.user-info")  %>% html_nodes("div.-flair") %>% html_nodes("span[title]") %>% html_attr("title")
+    user_badges = user_badges[-1]
+      user_badges = toString(user_badges)
+    return(user_badges)
+}
+
+
+question_mre <- function(question_links) {
+  
+  page2 <- read_html(question_links)
+   most_recent_editor = page2 %>% html_nodes("div.post-signature.flex--item") %>% html_nodes("div.user-info.user-hover")  %>% html_nodes("div.user-details") %>% html_nodes("a") %>% html_text(trim = T)
+  most_recent_editor = most_recent_editor[1]
+  
+}
+
+question_edit_time <- function(question_links) {
+  
+    page2 <- read_html(question_links)
+    edit_time = page2 %>% html_nodes("div.post-signature.flex--item") %>% html_nodes("div.user-info.user-hover") %>% html_nodes("div.user-action-time") %>% html_text(trim = T)
+  edit_time = edit_time[1]
+  
+}
+
+
+```
+
+Now, we go about collecting each comment to build out our overall answer column. The best format in order to store all of answer data would be in JSON. I am quite inexperienced with JSON, so instead we combine all of the data into a string. To access individual comments, we find the link within every answer path and loop each linkage to collect the text, name, and posting date for each comment for each answer for each question.
+
+### Comment Data
+
+```{r}
+
+#Comments
+retrieve_comment_path <- function(answer_path) {
+  answer_path %>% html_nodes('div.post-layout--right.js-post-comments-component') %>% html_nodes("ul") %>% html_children()
+}
+
+# Define the function to scrape comment data
+scrape_comments <- function(comment_paths) {
+  comment_data <- list()  
+  
+  for (i in seq_along(comment_paths)) {
+    comment_path <- comment_paths[[i]]
+    
+    comment_text <- comment_path %>% 
+      html_nodes("div.comment-text") %>% 
+      html_nodes("div.comment-body") %>% 
+      html_nodes("span.comment-copy") %>% 
+      html_text(trim = TRUE)
+    
+    comment_name <- comment_path %>% 
+      html_nodes("div.comment-text") %>% 
+      html_nodes("div.comment-body") %>% 
+      html_nodes("div.d-inline-flex") %>% 
+      html_nodes("a") %>% 
+      html_text(trim = TRUE)
+    
+    comment_date <- comment_path %>% 
+      html_nodes("div.comment-text") %>% 
+      html_nodes("div.comment-body") %>% 
+      html_nodes("span.comment-date") %>% 
+      html_text(trim = TRUE)
+    
+    comment_stuff <- paste(comment_text, comment_name, comment_date, sep = " ")
+    
+    # Add comment data to the list
+    comment_data[[i]] <- comment_stuff
+  }
+  #Convert it to string to combine the multiple sublistings into a string
+  comment_string <- toString(comment_data)
+  return(comment_string)
+}
+
+
+```
+
+
+### Answer Information
+
+each answer
+ the text
+ the person who posted
+ when they posted
+ their reputation and badge information
+ all of the comments on this answer
+ the text of the comment
+ who posted the comment
+ when they posted the comment
+
+We start by getting the individual pieces of the answer information. For the comment information, we use the previous comment scraping method. We loop through all answers available for each question page. Then, we combine all of our data, all answers together, and return it as a string that will conveniently fit into a singular data field. Otherwise, it is stuck as a nested list for multiple answers, which makes it much more difficult to combine into a data frame eventually.
+
+```{r}
+  
+scrape_answers <- function(page) {
+  
+  page <- read_html(page)
+  answer_data <- list()  
+  answer_path = page %>% html_nodes("div#answers") %>% html_nodes('div.answer')
+  
+    for (i in seq_along(answer_path)) {
+      answer <- answer_path[i]
+      
+      #Answer Text
+      answer_text = answer %>% html_nodes('div.post-layout') %>% html_nodes('div.answercell.post-layout--right') %>% html_nodes('div.s-prose.js-post-body') %>% html_nodes('p') %>% html_text(trim=T)
+      answer_text = toString(answer_text)
+      
+      #Votes
+      answer_votes = as.numeric(answer %>% html_nodes('div.post-layout') %>% html_nodes('div.votecell.post-layout--left') %>% html_nodes('div.js-voting-container') %>% html_nodes('div.js-vote-count') %>% html_text(trim=T))
+      
+      #Time
+      answer_time = answer %>% html_nodes('div.post-layout') %>% html_nodes('div.answercell.post-layout--right') %>% html_nodes('div.mt24') %>% html_nodes('div.user-info') %>% html_nodes('div.user-action-time') %>% html_nodes('span') %>% html_text(trim = T)
+      answer_time = answer_time[1]
+      
+      #Username
+      answer_username = answer %>% html_nodes('div.post-layout') %>% html_nodes('div.answercell.post-layout--right') %>% html_nodes('div.mt24') %>% html_nodes('div.user-info') %>% html_nodes('div.user-details') %>% html_nodes('a') %>% html_text(trim = T)
+      
+      #Reputation (WIP)
+      answer_reputation = (answer %>% html_nodes('div.post-layout') %>% html_nodes('div.answercell.post-layout--right') %>% html_nodes('div.mt24') %>% html_nodes('div.user-info') %>% html_nodes('div.user-details') %>% html_nodes('div.-flair') %>% html_children() %>% html_text(trim = T))[1]
+      
+      #Badges
+      answer_badges = answer %>% html_nodes('div.post-layout') %>% html_nodes('div.answercell.post-layout--right') %>% html_nodes('div.mt24') %>% html_nodes('div.user-info') %>% html_nodes('div.user-details') %>% html_nodes('div.-flair') %>% html_nodes("span[title]") %>% html_attr("title")
+      answer_badges = answer_badges[-1]
+      answer_badges = toString(answer_badges)
+      
+      # Comments
+      comment_path = retrieve_comment_path(answer)
+      if(length(comment_path) != 0) {
+        comment_data = scrape_comments(comment_path)
+      } else {
+        comment_data = NA
+      }
+      
+      answer_stuff <- paste("Username:", answer_username, "Votes:", answer_votes, "Time:", answer_time,  "Reputation:", answer_reputation, "Badges:", answer_badges, "Answer:",answer_text, "Comments:", comment_data,  sep = " ")
+      
+      answer_data[[i]] <- answer_stuff
+      
+    }
+  answer_string <- toString(answer_data)
+  return(answer_string)
+}
+
+
+
+```
+
+Finally, we use lapply to scrape the data for each link in the 50 page list. This makes a LOT of HTTP requests to the StackOverflow website. Unfortunately, that has given me timeouts for making too many requests. Therefore, at this point, I am unsure if it can fully gather all four dataframes in one go. If I had more time, I would find a workaround that is less computationally expensive.
+
+```{r}
+
+lapply_columns_1 <- function(question_links) {
+  
+  question_edit_l <- lapply(question_links, question_edit_time)
+  question_editt_df <- as.data.frame(do.call(rbind, question_edit_l))
+  colnames(question_editt_df) <- "Question_Edit_Time"
+
+  question_mre_lapply <- lapply(question_links, question_mre)
+  question_mre_df <- as.data.frame(do.call(rbind, question_mre_lapply))
+  colnames(question_mre_df) <- "Question_Most_Recent_Editor"
+  
+  question_badges_l <- lapply(question_links, question_badges)
+  question_badges_df <- as.data.frame(do.call(rbind, question_badges_l))
+  colnames(question_badges_df) <- "Question_Badges"
+
+   df <- as.data.frame(cbind(question_badges_df, question_mre_df, question_editt_df))
+   colnames(df) <- c("Question_Edit_Time", "Question_Most_Recent_Editor", "Question_Badges")
+  return(df)
+   
+}
+
+lapply_columns_2 <- function(question_links) {
+  
+  questions <- lapply(question_links, question_content)
+  question_content_df <- as.data.frame(do.call(rbind, questions))
+  colnames(question_content_df) <- "Question Text"
+  
+  answers_lap <- lapply(question_links, scrape_answers)
+  answers_df <- as.data.frame(do.call(rbind, answers_lap))
+  colnames(answers_df) <- "Answer Data"
+  
+  df <- as.data.frame(cbind(question_content_df, answers_df))
+   colnames(df) <- c("Question Text", "Answer Data")
+
+  return(df)
+}
+```
+
+We use our previously created function to get the links for each page to scrape all of our individual question data. The following lines are commented out because I am currently timed out on my StackOverflow connection.
+
+```{r}
+q1 <- question_links(url1)
+q2 <- question_links(url2)
+q3 <- question_links(url3)
+q4 <- question_links(url4)
+```
+
+Now, we build our final dataframes combining all of our information. All of these functions work and they build the final table as we would like, as shown by the screenshots attached above. However, I cannot knit the project with them in it as I am timed out on StackOverflow web requests. 
+
+ I understand that would make my assignment incomplete, but I have an example that displays we are able to get all of the final data for at least the first page.
+
+![Data Table Ex1](data_table_ex1.png)
+
+
+![Data Table Ex2](data_table_ex2.png)
+
+
+### Page 1 Data
+
+```{r}
+lapply_q1_1 <- lapply_columns_1(q1)
+lapply_q1_2 <- lapply_columns_2(q1)
+qss1 <- question_summary_scraper(url1)
+page1data<- data.frame(cbind(qss1,lapply_q1_1, lapply_q1_2))
+head(page1data)
+```
+
+### Page 2 Data
+
+
+```{r}
+
+lapply_q2_1 <- lapply_columns_1(q2)
+lapply_q2_2 <- lapply_columns_2(q2)
+qss2 <- question_summary_scraper(url2)
+page2data <- data.frame(cbind(qss2,lapply_q2_1, lapply_q2_2))
+head(page2data)
+```
+
+### Page 3 Data
+
+
+```{r}
+
+#lapply_q3_1 <- lapply_columns_1(q3)
+#lapply_q3_2 <- lapply_columns_2(q3)
+#qss3 <- question_summary_scraper(url3)
+#page3data <- data.frame(cbind(qss3,lapply_q3_1, lapply_q3_2))
+#head(page3data)
+
+```
+
+### Final Page Data
+
+```{r}
+
+#lapply_q4_1 <- lapply_columns_1(q4)
+#lapply_q4_2 <- lapply_columns_2(q4)
+#qss4 <- question_summary_scraper(url4)
+#page4data<- data.frame(cbind(qss4,lapply_q4_1, lapply_q4_2))
+#head(page4data)
+
+
+```
+
